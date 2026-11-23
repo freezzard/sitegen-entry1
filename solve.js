@@ -1,8 +1,10 @@
-// sitegen-entry1 v1: a faster drop-in for makefun-site 1.0.0, written from its README + spec.
-// Same answers, byte for byte; different engine: single-pass escaping, a stack-based inline
-// renderer (no slicing, no recursion), a regex-free block lexer, and a template interpreter
-// whose scopes are prototype-chained vars objects (lookup is a property read).
-// Memoisation lives inside one case only (slug cache); nothing is carried across cases.
+// sitegen-entry1: a faster drop-in for makefun-site 1.0.0, written from its README + spec.
+// Same answers, byte for byte; different engine: single-pass escaping (RegExp scan),
+// a stack-based inline renderer (no slicing, no recursion), a regex-free block lexer,
+// direct-to-parts markdown rendering, and a template interpreter whose scopes are
+// prototype-chained vars objects (lookup is a property read), with constant-partial
+// caching and int node kinds. Memoisation lives inside one case only; nothing is
+// carried across cases.
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
@@ -10,24 +12,13 @@ const RESERVED = ['posts', 'tags', 'page'];
 
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-/** Append `s[a..b)` to `out`, HTML-escaped. */
+/** Append `s[a..b)` to `out`, HTML-escaped. The scan runs in C++ (RegExp) instead of
+ * a per-char JS loop: micro-benched on Node 22 (1,070 practice bodies, 5 passes)
+ * at 5 ms min / 10 ms median vs 10 / 83 for the loop. */
+const ESC_RE = /[&<>"']/g;
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function escRange(out, s, a, b) {
-  let start = a;
-  for (let i = a; i < b; i++) {
-    const c = s.charCodeAt(i);
-    let e = null;
-    if (c === 38) e = '&amp;';
-    else if (c === 60) e = '&lt;';
-    else if (c === 62) e = '&gt;';
-    else if (c === 34) e = '&quot;';
-    else if (c === 39) e = '&#39;';
-    if (e !== null) {
-      if (i > start) out.push(s.slice(start, i));
-      out.push(e);
-      start = i + 1;
-    }
-  }
-  if (b > start) out.push(s.slice(start, b));
+  out.push(s.slice(a, b).replace(ESC_RE, (m) => ESC_MAP[m]));
 }
 
 /** The slug of `text` (NFKD, combining marks dropped, runs of other chars one `-`, max 64). */
@@ -500,7 +491,7 @@ function inlineStr(s, link) {
 /** `src` rendered: its HTML, its table of contents and its excerpt. */
 function renderMarkdown(src, link, cache) {
   const ids = new Set();
-  const blocks = [];
+  const parts = [];
   const toc = [];
   let excerpt = null;
   const lines = src.split('\n');
@@ -518,32 +509,31 @@ function renderMarkdown(src, link, cache) {
       i++;
       while (i < lines.length && !fenceClose(lines[i])) body.push(lines[i++]);
       i++;
-      const out = ['<pre><code'];
+      parts.push('<pre><code');
       if (lang !== '') {
-        out.push(' class="language-');
-        escRange(out, lang, 0, lang.length);
-        out.push('"');
+        parts.push(' class="language-');
+        escRange(parts, lang, 0, lang.length);
+        parts.push('"');
       }
-      out.push('>');
+      parts.push('>');
       for (const l of body) {
-        escRange(out, l, 0, l.length);
-        out.push('\n');
+        escRange(parts, l, 0, l.length);
+        parts.push('\n');
       }
-      out.push('</code></pre>');
-      blocks.push(out.join(''));
+      parts.push('</code></pre>', '\n');
       continue;
     }
     if (kind === 2) {
       const heading = headingOf(line);
       const id = uniqueSlug(slugify(heading.text, cache), ids);
       const html = inlineStr(heading.text, link);
-      blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>`);
+      parts.push(`<h${heading.depth} id="${id}">`, html, `</h${heading.depth}>`, '\n');
       if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
       i++;
       continue;
     }
     if (kind === 3) {
-      blocks.push('<hr>');
+      parts.push('<hr>', '\n');
       i++;
       continue;
     }
@@ -558,8 +548,12 @@ function renderMarkdown(src, link, cache) {
         const t = trimST(l);
         if (t !== '') kept.push(t);
       }
-      if (kept.length === 0) blocks.push('<blockquote>\n</blockquote>');
-      else blocks.push(`<blockquote>\n<p>${inlineStr(kept.join('\n'), link)}</p>\n</blockquote>`);
+      if (kept.length === 0) parts.push('<blockquote>\n</blockquote>', '\n');
+      else {
+        parts.push('<blockquote>\n<p>');
+        inlineInto(parts, kept.join('\n'), link);
+        parts.push('</p>\n</blockquote>', '\n');
+      }
       continue;
     }
     if (kind === 5 || kind === 6) {
@@ -593,10 +587,13 @@ function renderMarkdown(src, link, cache) {
       }
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && ordered[0] !== 1 ? `<ol start="${ordered[0]}">` : `<${tag}>`;
-      const out = [`${open}\n`];
-      for (const item of items) out.push(`<li>${inlineStr(item.join('\n'), link)}</li>\n`);
-      out.push(`</${tag}>`);
-      blocks.push(out.join(''));
+      parts.push(open, '\n');
+      for (const item of items) {
+        parts.push('<li>');
+        inlineInto(parts, item.join('\n'), link);
+        parts.push('</li>\n');
+      }
+      parts.push(`</${tag}>`, '\n');
       continue;
     }
     const body = [trimST(line)];
@@ -606,16 +603,13 @@ function renderMarkdown(src, link, cache) {
       if (k2 === 0 || k2 === 1 || k2 === 2 || k2 === 3) break;
       body.push(trimST(lines[i++]));
     }
-    const html = inlineStr(body.join('\n'), link);
-    if (excerpt === null) excerpt = html;
-    blocks.push(`<p>${html}</p>`);
+    parts.push('<p>');
+    const start = parts.length;
+    inlineInto(parts, body.join('\n'), link);
+    if (excerpt === null) excerpt = parts.slice(start).join('');
+    parts.push('</p>', '\n');
   }
-  const htmlOut = [];
-  for (const b of blocks) {
-    htmlOut.push(b);
-    htmlOut.push('\n');
-  }
-  return { html: htmlOut.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
